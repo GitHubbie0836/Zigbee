@@ -1,0 +1,217 @@
+blueprint:
+  name: Sync Weather Forecast to SONOFF SNZB-02UL (Zigbee2MQTT)
+  description: >-
+    Syncs the current or future hourly weather forecast icon (with automatic
+    unit conversion and range clamping) and outdoor temperature, humidity, and
+    pressure to a SONOFF SNZB-02UL E-Ink display via Zigbee2MQTT.
+    Note: remote_sensors_state must be set to "enable" on the device once.
+  domain: automation
+  homeassistant:
+    min_version: 2024.10.0
+  input:
+    snzb_device:
+      name: SONOFF SNZB-02UL Device
+      description: Select your SNZB-02UL E-Ink display (Zigbee2MQTT).
+      selector:
+        device:
+          filter:
+            - integration: mqtt
+              manufacturer: SONOFF
+              model: E-ink screen temperature and humidity sensor
+    weather_source:
+      name: Weather Forecast Source
+      description: The weather entity providing the forecast data and icon.
+      selector:
+        entity:
+          filter:
+            - domain: weather
+    forecast_hours:
+      name: Forecast Hours Ahead
+      description: >-
+        0 = show current weather. 1–24 = show the hourly forecast X hours from
+        now (requires a weather integration that supports hourly forecasts).
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 24
+          unit_of_measurement: h
+          mode: slider
+    update_interval:
+      name: Update Interval
+      description: >-
+        How often to push values to the display. The device is battery powered
+        and sleeps, so don't update more often than needed. The icon is also
+        updated right away when the weather condition changes.
+      default: "/30"
+      selector:
+        select:
+          options:
+            - label: Every 5 minutes
+              value: "/5"
+            - label: Every 10 minutes
+              value: "/10"
+            - label: Every 15 minutes
+              value: "/15"
+            - label: Every 30 minutes
+              value: "/30"
+            - label: Every hour
+              value: "0"
+    exceptional_mapping:
+      name: Exceptional Weather Icon
+      description: >-
+        Choose which icon to show when the forecast reports 'exceptional'
+        (storms, haze, dust, extreme heat/cold).
+      default: windy
+      selector:
+        select:
+          options:
+            - label: Windy (default)
+              value: windy
+            - label: Overcast
+              value: overcast
+            - label: Rain
+              value: rain
+
+mode: single
+max_exceeded: silent
+
+variables:
+  snzb_device: !input snzb_device
+  weather_source: !input weather_source
+  forecast_hours: !input forecast_hours
+  exceptional_mapping: !input exceptional_mapping
+  dev_entities: "{{ device_entities(snzb_device) }}"
+  weather_select: "{{ dev_entities | select('match', '^select\\..*_weather$') | first | default('') }}"
+  temp_number: "{{ dev_entities | select('match', '^number\\..*_remote_temperature$') | first | default('') }}"
+  hum_number: "{{ dev_entities | select('match', '^number\\..*_remote_humidity$') | first | default('') }}"
+  press_number: "{{ dev_entities | select('match', '^number\\..*_remote_pressure$') | first | default('') }}"
+
+triggers:
+  - trigger: time_pattern
+    minutes: !input update_interval
+  - trigger: state
+    entity_id: !input weather_source
+    to: ~
+
+conditions:
+  - condition: template
+    value_template: "{{ states(weather_source) not in ['unavailable', 'unknown', 'none'] }}"
+
+actions:
+  - if:
+      - condition: template
+        value_template: "{{ (forecast_hours | int) > 0 }}"
+    then:
+      - action: weather.get_forecasts
+        continue_on_error: true
+        target:
+          entity_id: "{{ weather_source }}"
+        data:
+          type: hourly
+        response_variable: hourly_data
+      - variables:
+          forecast_list: "{{ (hourly_data | default({}, true)).get(weather_source, {}).get('forecast', []) }}"
+          wanted_ts: "{{ as_timestamp(now()) + (forecast_hours | int) * 3600 }}"
+          idx: >-
+            {{ [forecast_list | map(attribute='datetime') | map('as_timestamp', 0)
+                | select('lt', wanted_ts - 1800) | list | length,
+                (forecast_list | length) - 1] | min }}
+          target_entry: "{{ forecast_list[idx] if (forecast_list | length) > 0 else {} }}"
+          target_condition: "{{ target_entry.get('condition', states(weather_source)) }}"
+          target_temp: "{{ target_entry.get('temperature', state_attr(weather_source, 'temperature')) }}"
+          target_hum: "{{ target_entry.get('humidity', state_attr(weather_source, 'humidity')) }}"
+          target_press: "{{ target_entry.get('pressure', state_attr(weather_source, 'pressure')) }}"
+    else:
+      - variables:
+          target_condition: "{{ states(weather_source) }}"
+          target_temp: "{{ state_attr(weather_source, 'temperature') }}"
+          target_hum: "{{ state_attr(weather_source, 'humidity') }}"
+          target_press: "{{ state_attr(weather_source, 'pressure') }}"
+
+  - if:
+      - condition: template
+        value_template: "{{ weather_select != '' }}"
+    then:
+      - action: select.select_option
+        continue_on_error: true
+        target:
+          entity_id: "{{ weather_select }}"
+        data:
+          option: >
+            {% if target_condition in ['sunny', 'clear-night'] %}
+              sunny
+            {% elif target_condition == 'partlycloudy' %}
+              partly_cloudy
+            {% elif target_condition in ['cloudy', 'fog'] %}
+              overcast
+            {% elif target_condition in ['rainy', 'pouring', 'lightning', 'lightning-rainy', 'hail', 'snowy-rainy'] %}
+              rain
+            {% elif target_condition in ['snowy'] %}
+              snow
+            {% elif target_condition in ['windy', 'windy-variant'] %}
+              windy
+            {% elif target_condition == 'exceptional' %}
+              {{ exceptional_mapping }}
+            {% else %}
+              overcast
+            {% endif %}
+
+  - if:
+      - condition: template
+        value_template: "{{ temp_number != '' and is_number(target_temp) }}"
+    then:
+      - action: number.set_value
+        continue_on_error: true
+        target:
+          entity_id: "{{ temp_number }}"
+        data:
+          value: >-
+            {% set raw_t = target_temp | float %}
+            {% set t_unit = state_attr(weather_source, 'temperature_unit') %}
+            {% set t_c = ((raw_t - 32) * 5 / 9) if t_unit == '°F' else raw_t %}
+            {{ [[t_c | round(1), -20.0] | max, 60.0] | min }}
+
+  - if:
+      - condition: template
+        value_template: "{{ hum_number != '' and is_number(target_hum) }}"
+    then:
+      - action: number.set_value
+        continue_on_error: true
+        target:
+          entity_id: "{{ hum_number }}"
+        data:
+          value: "{{ [[target_hum | float, 5.0] | max, 95.0] | min }}"
+
+  - if:
+      - condition: template
+        value_template: "{{ press_number != '' and is_number(target_press) }}"
+    then:
+      - action: number.set_value
+        continue_on_error: true
+        target:
+          entity_id: "{{ press_number }}"
+        data:
+          value: >-
+            {% set raw_p = target_press | float %}
+            {% set p_unit = state_attr(weather_source, 'pressure_unit') | default('', true) | lower %}
+            {% if p_unit in ['hpa', 'mbar'] %}
+              {% set p_hpa = raw_p %}
+            {% elif p_unit == 'kpa' %}
+              {% set p_hpa = raw_p * 10 %}
+            {% elif p_unit == 'pa' %}
+              {% set p_hpa = raw_p / 100 %}
+            {% elif p_unit == 'inhg' %}
+              {% set p_hpa = raw_p * 33.8639 %}
+            {% elif p_unit == 'mmhg' %}
+              {% set p_hpa = raw_p * 1.33322 %}
+            {% elif raw_p < 40 %}
+              {% set p_hpa = raw_p * 33.8639 %}
+            {% elif raw_p < 150 %}
+              {% set p_hpa = raw_p * 10 %}
+            {% elif raw_p < 850 %}
+              {% set p_hpa = raw_p * 1.33322 %}
+            {% else %}
+              {% set p_hpa = raw_p %}
+            {% endif %}
+            {{ [[p_hpa | round(1), 700.0] | max, 1100.0] | min }}
